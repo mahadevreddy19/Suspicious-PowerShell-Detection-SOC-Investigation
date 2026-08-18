@@ -1,53 +1,21 @@
 # Suspicious PowerShell Detection & SOC Investigation
 
-A hands-on SOC L1 lab using **Splunk Enterprise** and **Sysmon** to detect, investigate, and disposition suspicious PowerShell activity.
+A Splunk + Sysmon lab where I detected suspicious PowerShell execution, investigated the process, correlated Sysmon events using `ProcessGuid`, checked for network activity, and closed the alert after validating the activity as authorized testing.
 
-The lab covers PowerShell detection, process investigation, `ProcessGuid` correlation, network investigation, DNS analysis, MITRE ATT&CK mapping, and final alert disposition.
+## What I Built
 
----
+- Windows endpoint with Sysmon
+- Splunk Universal Forwarder for log collection
+- Splunk Enterprise as the SIEM
+- Sysmon Event ID 1 for process creation
+- Sysmon Event ID 3 for network connections
+- Sysmon Event ID 22 for DNS queries
+- SPL detection for PowerShell `ExecutionPolicy Bypass`
+- Process-level investigation using `ProcessGuid`
 
-## Lab Objective
+## Lab Flow
 
-The goal of this lab was to investigate a PowerShell execution that used:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Write-Host 'SOC Lab Investigation Test'"
-```
-
-I wanted to investigate the activity the same way a SOC L1 analyst would:
-
-1. Detect the suspicious activity.
-2. Identify the user and process.
-3. Investigate the process details.
-4. Correlate the process with other Sysmon events.
-5. Check for network activity.
-6. Investigate DNS activity.
-7. Determine whether the activity was actually malicious.
-8. Close or escalate the alert based on the evidence.
-
-The PowerShell activity was an **authorized test performed inside my own lab environment**.
-
----
-
-## Lab Environment
-
-| Component | Details |
-|---|---|
-| SIEM | Splunk Enterprise |
-| Endpoint | Windows |
-| Endpoint Telemetry | Sysmon |
-| Log Forwarder | Splunk Universal Forwarder |
-| Splunk Index | `main` |
-| Process Creation | Sysmon Event ID 1 |
-| Network Connection | Sysmon Event ID 3 |
-| DNS Query | Sysmon Event ID 22 |
-| Splunk Receiving Port | TCP 9997 |
-
----
-
-## Lab Architecture
-
-```text
+````text
 Windows Endpoint
        |
        v
@@ -61,45 +29,56 @@ Splunk Universal Forwarder
 Splunk Enterprise
        |
        v
-SOC Investigation
-       |
-       v
-Detection -> Triage -> Correlation -> Disposition
-```
+Detection -> Investigation -> Correlation -> Disposition
+````
+
+## Environment
+
+| Component | Details |
+|---|---|
+| SIEM | Splunk Enterprise |
+| Endpoint | Windows |
+| Telemetry | Sysmon |
+| Forwarder | Splunk Universal Forwarder |
+| Index | `main` |
+| Process Creation | Sysmon Event ID 1 |
+| Network Connection | Sysmon Event ID 3 |
+| DNS Query | Sysmon Event ID 22 |
+| Receiving Port | TCP 9997 |
 
 ---
 
-# 1. Generate the Test Activity
+## 1. Test Activity
 
-I generated a controlled PowerShell event on the Windows endpoint:
+I generated a controlled PowerShell event on the Windows lab machine:
 
-```powershell
+````powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Write-Host 'SOC Lab Investigation Test'"
-```
+````
 
-The command was intentionally designed to generate a suspicious-looking PowerShell process creation event.
+The purpose was to generate telemetry that a SOC analyst could investigate.
+
+This was an authorized test inside my lab environment. No malware was used.
 
 The important indicator was:
 
-```text
+````text
 -ExecutionPolicy Bypass
-```
+````
 
-This can be suspicious in a real environment because PowerShell is frequently abused for command and script execution.
+This can be suspicious in an enterprise environment because PowerShell is commonly abused for command and script execution.
 
-However, I did **not** immediately classify the event as malicious.
-
-The purpose of the investigation was to determine what actually happened.
+I therefore treated the event as suspicious, not automatically malicious.
 
 ---
 
-# 2. Detect the PowerShell Activity
+## 2. Splunk Detection
 
-I used Sysmon Event ID 1 because it records process creation.
+I started with Sysmon Event ID 1 because it records process creation.
 
 ### SPL
 
-```spl
+````spl
 index=main sourcetype=XmlWinEventLog EventCode=1 earliest=-24h
 | where match(lower(CommandLine), "executionpolicy\s+bypass")
 | eval Severity="Medium"
@@ -107,27 +86,27 @@ index=main sourcetype=XmlWinEventLog EventCode=1 earliest=-24h
 | eval MITRE_Technique="T1059.001 - PowerShell"
 | table _time Severity Detection MITRE_Technique host User Image ParentImage CommandLine ProcessId ProcessGuid
 | sort -_time
-```
+````
 
 ### Detection Result
 
-The query identified the PowerShell activity with the following details:
+The query identified the PowerShell test:
 
 | Field | Value |
 |---|---|
 | Host | `Stark` |
 | User | `Stark\PARADOX` |
 | Process | `powershell.exe` |
-| Process ID | `420` |
+| PID | `420` |
 | Severity | Medium |
 | Detection | Suspicious PowerShell - ExecutionPolicy Bypass |
-| MITRE ATT&CK | T1059.001 |
+| MITRE | T1059.001 |
 
 The command line contained:
 
-```text
+````text
 -NoProfile -ExecutionPolicy Bypass
-```
+````
 
 ### Screenshot
 
@@ -135,30 +114,30 @@ The command line contained:
 
 ---
 
-# 3. Investigate the Process
+## 3. Process Investigation
 
-After detecting the PowerShell activity, I investigated the process details.
+After finding the alert, I investigated the process details.
 
 ### SPL
 
-```spl
+````spl
 index=main sourcetype=XmlWinEventLog EventCode=1 earliest=-24h
 | search "SOC Lab Investigation Test"
 | table _time host User Image ParentImage CommandLine ProcessId ProcessGuid ParentProcessGuid
 | sort _time
-```
+````
 
-The investigation returned the process information needed to continue the investigation.
+This gave me the process information needed for the next stage of the investigation.
 
-### Information Reviewed
+### Fields Reviewed
 
 - Timestamp
 - Host
 - User
-- Process image
-- Parent process
-- Command line
-- Process ID
+- Image
+- ParentImage
+- CommandLine
+- ProcessId
 - ProcessGuid
 - ParentProcessGuid
 
@@ -168,68 +147,54 @@ The investigation returned the process information needed to continue the invest
 
 ---
 
-# 4. PID Reuse Investigation
+## 4. PID Reuse and ProcessGuid
 
-During the investigation, I found an important issue with using the Process ID alone.
+One useful finding during the investigation was that PID `420` was not enough to identify the process.
 
-The PowerShell process used:
+I found that PID `420` had previously been used by another process and later appeared on the PowerShell event.
 
-```text
-ProcessId = 420
-```
+That means a query based only on:
 
-However, PID `420` had also appeared in an earlier event associated with another process.
-
-This is possible because Windows can reuse Process IDs after a process terminates.
-
-Therefore, using:
-
-```text
+````text
 ProcessId=420
-```
+````
 
-alone could incorrectly associate events from different processes.
+can potentially correlate unrelated events.
 
-This led me to use the Sysmon `ProcessGuid` for process-level correlation.
+I therefore used the Sysmon `ProcessGuid` associated with the PowerShell process.
+
+This gave me a much more reliable way to investigate activity belonging to that specific process.
 
 ---
 
-# 5. ProcessGuid Correlation
+## 5. Network Investigation
 
-The PowerShell process had the following ProcessGuid:
+Next, I checked whether the specific PowerShell process created a network connection.
 
-```text
+The ProcessGuid from the PowerShell event was:
+
+````text
 {f0be383d-f49a-6a83-710b-000000001a00}
-```
-
-Using `ProcessGuid` allowed me to investigate events belonging specifically to this PowerShell process instead of relying only on PID `420`.
-
-This was important for the next stage of the investigation.
-
----
-
-# 6. Network Investigation
-
-I checked whether the specific PowerShell process established any network connection.
+````
 
 ### SPL
 
-```spl
+````spl
 index=main sourcetype=XmlWinEventLog EventCode=3 earliest=-24h
 | search ProcessGuid="{f0be383d-f49a-6a83-710b-000000001a00}"
 | table _time host User Image DestinationIp DestinationHostname DestinationPort ProcessId ProcessGuid
 | sort _time
-```
+````
 
 ### Result
 
-```text
+````text
 0 events
-```
+````
 
-No Sysmon Event ID 3 network connection was observed for the specific PowerShell ProcessGuid during the investigation period.
+No Sysmon Event ID 3 network connection was observed for this specific PowerShell process during the investigation window.
 
-This meant there was **no observed network connection associated with this specific PowerShell process**.
+This meant I had no evidence of a network connection originating from the detected PowerShell process.
 
 ### Screenshot
 
@@ -237,32 +202,26 @@ This meant there was **no observed network connection associated with this speci
 
 ---
 
-# 7. DNS Investigation
+## 6. DNS Investigation
 
-I also checked the DNS telemetry generated during the lab.
+I also investigated DNS activity separately.
 
 ### SPL
 
-```spl
+````spl
 index=main sourcetype=XmlWinEventLog EventCode=22 earliest=-24h
 | search QueryName="example.com"
 | table _time host User Image QueryName ProcessId ProcessGuid
 | sort _time
-```
+````
 
-A DNS query for:
+A DNS query for `example.com` was present in the logs.
 
-```text
-example.com
-```
+However, the ProcessGuid associated with that DNS event did not match the ProcessGuid of the suspicious PowerShell process.
 
-was present in the logs.
+I therefore did not attribute the DNS activity to the PowerShell alert.
 
-However, the DNS event had a **different ProcessGuid** from the suspicious PowerShell process.
-
-Therefore, I did not associate the DNS event with the PowerShell detection.
-
-This was an important correlation check because activity occurring on the same host does not automatically mean that the events came from the same process.
+This was important because two events on the same host should not automatically be treated as related without supporting evidence.
 
 ### Screenshot
 
@@ -270,65 +229,61 @@ This was an important correlation check because activity occurring on the same h
 
 ---
 
-# 8. Investigation Findings
+## 7. Investigation Summary
 
-| Investigation Check | Result |
+| Check | Result |
 |---|---|
-| PowerShell execution detected | Yes |
-| `ExecutionPolicy Bypass` detected | Yes |
+| Suspicious PowerShell detected | Yes |
+| `ExecutionPolicy Bypass` present | Yes |
 | Process investigated | Yes |
 | ProcessGuid identified | Yes |
-| Network connection from specific PowerShell process | None observed |
-| DNS activity observed | Yes |
-| DNS linked to suspicious PowerShell ProcessGuid | No |
+| Network connection from specific process | None observed |
+| DNS activity found | Yes |
+| DNS linked to PowerShell process | No |
 | Malicious payload observed | No |
-| Evidence of exfiltration | None observed |
-| Activity source | Authorized lab testing |
+| Exfiltration evidence | None observed |
+| Activity | Authorized lab testing |
 | Final disposition | Benign |
 
 ---
 
-# 9. MITRE ATT&CK Mapping
+## 8. MITRE ATT&CK
 
-## T1059.001 — Command and Scripting Interpreter: PowerShell
+### T1059.001 — Command and Scripting Interpreter: PowerShell
 
-The detected behavior maps to:
+The detected activity maps to:
 
 **T1059.001 — PowerShell**
 
-The mapping is based on the PowerShell process execution observed through Sysmon Event ID 1.
+The technique was identified from the PowerShell process creation telemetry collected by Sysmon.
 
 ---
 
-# 10. Final SOC Disposition
+## 9. Final SOC Disposition
 
-## Alert
+### Alert
 
 **Suspicious PowerShell - ExecutionPolicy Bypass**
 
-## Severity
+### Severity
 
 **Medium**
 
-## Investigation
+### Investigation Result
 
-The alert was generated because PowerShell was executed with `ExecutionPolicy Bypass`.
+The PowerShell command was part of an authorized lab test.
 
-I investigated the PowerShell process and identified its `ProcessGuid`.
+I investigated the specific process using its `ProcessGuid` and checked for associated network activity.
 
-I then checked Sysmon Event ID 3 for network activity associated with that exact ProcessGuid.
+No Sysmon Event ID 3 network connection was found for that process.
 
-No associated network connection was observed.
+The DNS activity found during the investigation belonged to a different ProcessGuid and was not correlated with the PowerShell process.
 
-I also investigated the observed DNS activity, but its ProcessGuid did not match the PowerShell process.
-
-The PowerShell activity was part of the authorized security test performed in the lab.
-
-## Final Verdict
+### Final Verdict
 
 **Closed - Benign / Authorized Security Testing**
 
-## Escalation
+### Escalation
 
 **Not required**
 
@@ -338,83 +293,65 @@ The PowerShell activity was part of the authorized security test performed in th
 
 ---
 
-# 11. Investigation Timeline
+## 10. Investigation Timeline
 
-```text
+````text
 PowerShell executed
-        |
-        v
+       |
+       v
 ExecutionPolicy Bypass detected
-        |
-        v
-Splunk detection triggered
-        |
-        v
-Process details investigated
-        |
-        v
+       |
+       v
+Splunk alert generated
+       |
+       v
+Process investigated
+       |
+       v
 ProcessGuid identified
-        |
-        v
+       |
+       v
 Network activity checked
-        |
-        v
+       |
+       v
 No associated network connection
-        |
-        v
-DNS activity investigated
-        |
-        v
+       |
+       v
+DNS activity checked separately
+       |
+       v
 Different ProcessGuid
-        |
-        v
+       |
+       v
 Authorized lab activity confirmed
-        |
-        v
+       |
+       v
 Alert closed as benign
-```
+````
 
 ---
 
-# 12. What I Learned
+## 11. What I Learned
 
-### Process ID is not enough
+### Process IDs are not enough
 
-Windows can reuse PIDs. During this investigation, PID `420` appeared with different processes at different times.
+Windows can reuse PIDs, so I learned to use Sysmon `ProcessGuid` when correlating process-related events.
 
-Using Sysmon `ProcessGuid` prevented incorrect correlation.
+### Suspicious does not mean malicious
 
-### Suspicious does not automatically mean malicious
-
-`ExecutionPolicy Bypass` is a useful detection indicator, but it should trigger investigation rather than automatically result in escalation.
+`ExecutionPolicy Bypass` is a useful detection indicator, but it needs context and investigation before an alert should be escalated.
 
 ### Correlation needs evidence
 
-The DNS event was observed on the same endpoint, but its ProcessGuid did not match the suspicious PowerShell process.
+The DNS event was on the same host, but its ProcessGuid was different. I did not associate it with the PowerShell alert without supporting evidence.
 
-I therefore did not treat it as related activity.
+### Detection is only the first step
 
-### Detection is only the beginning
-
-The important part of a SOC workflow is not just creating a detection.
-
-The analyst needs to:
-
-```text
-Detect
-   ↓
-Investigate
-   ↓
-Correlate
-   ↓
-Validate
-   ↓
-Disposition
-```
+The useful part of a SOC workflow is not just generating an alert. The analyst needs to investigate it and reach a defensible disposition.
 
 ---
 
-# 13. Skills Demonstrated
+## 12. Skills Used
 
 - Splunk Enterprise
 - SPL
@@ -433,9 +370,9 @@ Disposition
 
 ---
 
-# 14. Repository Structure
+## 13. Repository Structure
 
-```text
+````text
 Suspicious-PowerShell-Detection-SOC-Investigation/
 │
 ├── README.md
@@ -446,17 +383,17 @@ Suspicious-PowerShell-Detection-SOC-Investigation/
     ├── 03-network-correlation.png
     ├── 04-dns-investigation.png
     └── 05-final-disposition.png
-```
+````
 
 ---
 
-# Conclusion
+## Conclusion
 
-This project gave me hands-on experience investigating suspicious PowerShell activity with Splunk and Sysmon.
+I built this lab to practice a basic SOC investigation around suspicious PowerShell activity.
 
-The investigation started with a PowerShell `ExecutionPolicy Bypass` detection and continued through process analysis, PID reuse investigation, ProcessGuid correlation, network investigation, and DNS analysis.
+The investigation started with a PowerShell `ExecutionPolicy Bypass` detection. I then investigated the process, noticed the PID reuse issue, switched to `ProcessGuid` for correlation, checked for network activity, and investigated the DNS event separately.
 
-The specific PowerShell process had no observed Sysmon network connection, and the DNS activity found during the investigation belonged to a different process.
+The specific PowerShell process had no observed Sysmon Event ID 3 network connection. The DNS activity found during the investigation belonged to a different ProcessGuid, so I did not associate it with the PowerShell alert.
 
 The activity was confirmed as an authorized lab test.
 
